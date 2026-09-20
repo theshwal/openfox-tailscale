@@ -164,3 +164,61 @@ test('start uses a free port and stop removes only its own foreground entry', as
   ])
   assert.equal(spawnCalls.some(([, args]) => args.includes('reset')), false)
 })
+
+
+test('stop cancels an in-flight preview start without leaving an orphan', async () => {
+  let active = false
+  const spawnCalls = []
+  const foregroundChild = makeChild({ stdout: 'https://node.tailnet.ts.net:8443/\n' })
+
+  const spawn = (command, args) => {
+    spawnCalls.push([command, args])
+    return foregroundChild
+  }
+
+  const execFile = (_command, args, _options, callback) => {
+    if (args[0] === 'serve' && args[1] === 'status') {
+      const status = active
+        ? FIXTURE
+        : {
+            TCP: { 443: { HTTPS: true } },
+            Web: {
+              'node.tailnet.ts.net:443': {
+                Handlers: { '/': { Proxy: 'http://127.0.0.1:10369' } },
+              },
+            },
+          }
+      callback(null, JSON.stringify(status), '')
+      return
+    }
+    callback(new Error(`unexpected command: ${args.join(' ')}`), '', '')
+  }
+
+  const manager = new TailscalePreviewManager({
+    spawn,
+    execFile,
+    sleep: () => new Promise((resolve) => setImmediate(resolve)),
+    kill: () => {
+      active = false
+      foregroundChild.exitCode = 0
+      foregroundChild.emit('exit', 0)
+    },
+    stabilizeTimeoutMs: 100,
+    removalTimeoutMs: 100,
+    pollMs: 1,
+  })
+
+  const startResult = manager.start('/tmp/racy-project', 10469).then(
+    () => null,
+    (error) => error,
+  )
+
+  await new Promise((resolve) => setImmediate(resolve))
+  await manager.stop('/tmp/racy-project')
+
+  const error = await startResult
+  assert.ok(error instanceof Error)
+  assert.match(error.message, /cancelled|exited/)
+  assert.equal(manager.isActive('/tmp/racy-project'), false)
+  assert.equal(spawnCalls.some(([, args]) => args.includes('reset')), false)
+})
