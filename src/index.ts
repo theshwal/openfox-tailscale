@@ -167,7 +167,7 @@ export function register(registry: PluginRegistry): void {
 
   // OpenFox 2.0.151 predates these two hook names in the published type union.
   // The core PR adds them without changing the generic PluginHookPayload shape.
-  const registerDevServerHook = registry.registerHook.bind(registry) as DevServerHookRegistrar
+  const registerDevServerHook = registry.registerHook.bind(registry) as unknown as DevServerHookRegistrar
 
   registerDevServerHook('devserver.started', (payload) => {
     void handleStarted(payload, context, manager).catch((error: unknown) => {
