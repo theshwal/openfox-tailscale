@@ -102,6 +102,7 @@ export class TailscalePreviewManager {
     this.removalTimeoutMs = options.removalTimeoutMs ?? DEFAULT_REMOVAL_VERIFY_TIMEOUT_MS
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS
     this.handles = new Map()
+    this.pending = new Map()
   }
 
   key(workdir) {
@@ -263,87 +264,160 @@ export class TailscalePreviewManager {
 
   async start(workdir, targetPort) {
     const key = this.key(workdir)
-    if (this.handles.has(key)) {
-      throw new Error('A Tailscale preview is already active for this workdir')
+    if (this.handles.has(key) || this.pending.has(key)) {
+      throw new Error('A Tailscale preview is already active or starting for this workdir')
     }
 
-    const remotePort = pickFreeServePort(await this.listUsedServePorts())
-    const args = ['serve', '--yes', `--https=${remotePort}`, `http://localhost:${targetPort}`]
+    const control = {
+      cancelled: false,
+      child: null,
+      remotePort: null,
+      done: null,
+    }
+    this.pending.set(key, control)
 
-    const child = this.spawn('tailscale', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    })
+    const operation = this.startInternal(key, targetPort, control)
+    control.done = operation
 
-    let stdoutBuffer = ''
-    let stderrBuffer = ''
-    let exited = false
-    let exitCode = null
+    try {
+      return await operation
+    } finally {
+      if (this.pending.get(key) === control) {
+        this.pending.delete(key)
+      }
+    }
+  }
 
-    child.stdout?.on('data', (data) => {
-      stdoutBuffer += data.toString()
-    })
-    child.stderr?.on('data', (data) => {
-      stderrBuffer += data.toString()
-    })
+  async startInternal(key, targetPort, control) {
+    let child = null
+    let remotePort = null
 
-    const earlyExit = new Promise((resolvePromise) => {
-      child.once('error', (error) => {
-        exited = true
-        resolvePromise({ kind: 'exit', code: -1, stderr: error.message })
+    try {
+      if (control.cancelled) throw new Error('Tailscale preview start cancelled')
+
+      remotePort = pickFreeServePort(await this.listUsedServePorts())
+      control.remotePort = remotePort
+
+      if (control.cancelled) throw new Error('Tailscale preview start cancelled')
+
+      const args = ['serve', '--yes', `--https=${remotePort}`, `http://localhost:${targetPort}`]
+
+      child = this.spawn('tailscale', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       })
-      child.once('exit', (code) => {
-        exited = true
-        exitCode = code
-        resolvePromise({ kind: 'exit', code, stderr: stderrBuffer })
+      control.child = child
+
+      let stdoutBuffer = ''
+      let stderrBuffer = ''
+      let exited = false
+      let exitCode = null
+
+      child.stdout?.on('data', (data) => {
+        stdoutBuffer += data.toString()
       })
-    })
+      child.stderr?.on('data', (data) => {
+        stderrBuffer += data.toString()
+      })
 
-    const stabilized = this.waitForEntry(remotePort).then((found) => ({
-      kind: 'status',
-      found,
-    }))
+      const earlyExit = new Promise((resolvePromise) => {
+        child.once('error', (error) => {
+          exited = true
+          resolvePromise({ kind: 'exit', code: -1, stderr: error.message })
+        })
+        child.once('exit', (code) => {
+          exited = true
+          exitCode = code
+          resolvePromise({ kind: 'exit', code, stderr: stderrBuffer })
+        })
+      })
 
-    const outcome = await Promise.race([earlyExit, stabilized])
+      const stabilized = this.waitForEntry(remotePort).then((found) => ({
+        kind: 'status',
+        found,
+      }))
 
-    if (outcome.kind === 'exit') {
-      await this.killChild(child)
-      throw new Error(
-        `tailscale serve exited before becoming active (code=${outcome.code ?? 'n/a'})` +
-          (outcome.stderr?.trim() ? `: ${outcome.stderr.trim()}` : ''),
-      )
+      const outcome = await Promise.race([earlyExit, stabilized])
+
+      if (control.cancelled) {
+        throw new Error('Tailscale preview start cancelled')
+      }
+
+      if (outcome.kind === 'exit') {
+        throw new Error(
+          `tailscale serve exited before becoming active (code=${outcome.code ?? 'n/a'})` +
+            (outcome.stderr?.trim() ? `: ${outcome.stderr.trim()}` : ''),
+        )
+      }
+
+      const found = outcome.found
+      if (!found || (!found.webKey && !found.tcpKey)) {
+        const detail = exited ? ` (process exit code=${exitCode ?? 'n/a'})` : ''
+        throw new Error(`tailscale serve did not register the entry in time${detail}`)
+      }
+
+      const urlFromStdout = extractFirstUrl(stdoutBuffer)
+      const urlFromStatus = found.webKey ? `https://${found.webKey}/` : null
+      const url = urlFromStdout ?? urlFromStatus
+
+      if (!url) {
+        throw new Error('tailscale serve did not expose a usable HTTPS URL')
+      }
+
+      if (control.cancelled) {
+        throw new Error('Tailscale preview start cancelled')
+      }
+
+      const handle = {
+        child,
+        remotePort,
+        url,
+        workdir: key,
+      }
+      this.handles.set(key, handle)
+
+      this.logger.info('Tailscale preview started', { workdir: key, remotePort, url })
+      return { url, remotePort }
+    } catch (error) {
+      if (child) {
+        try {
+          await this.killChild(child)
+        } catch {
+          // Continue with status-based targeted cleanup.
+        }
+      }
+
+      if (remotePort !== null) {
+        const gone = await this.waitForEntryGone(remotePort)
+        if (!gone) {
+          await this.forceRemoveEntry({ remotePort })
+        }
+      }
+
+      throw error
     }
-
-    const found = outcome.found
-    if (!found || (!found.webKey && !found.tcpKey)) {
-      await this.killChild(child)
-      const detail = exited ? ` (process exit code=${exitCode ?? 'n/a'})` : ''
-      throw new Error(`tailscale serve did not register the entry in time${detail}`)
-    }
-
-    const urlFromStdout = extractFirstUrl(stdoutBuffer)
-    const urlFromStatus = found.webKey ? `https://${found.webKey}/` : null
-    const url = urlFromStdout ?? urlFromStatus
-
-    if (!url) {
-      await this.killChild(child)
-      throw new Error('tailscale serve did not expose a usable HTTPS URL')
-    }
-
-    const handle = {
-      child,
-      remotePort,
-      url,
-      workdir: key,
-    }
-    this.handles.set(key, handle)
-
-    this.logger.info('Tailscale preview started', { workdir: key, remotePort, url })
-    return { url, remotePort }
   }
 
   async stop(workdir) {
     const key = this.key(workdir)
+    const pending = this.pending.get(key)
+
+    if (pending) {
+      pending.cancelled = true
+      if (pending.child) {
+        try {
+          await this.killChild(pending.child)
+        } catch {
+          // startInternal will perform status-based targeted cleanup.
+        }
+      }
+      try {
+        await pending.done
+      } catch {
+        // Cancellation is expected; startInternal owns cleanup.
+      }
+    }
+
     const handle = this.handles.get(key)
     if (!handle) return
 
@@ -369,7 +443,7 @@ export class TailscalePreviewManager {
   }
 
   async stopAll() {
-    const workdirs = Array.from(this.handles.keys())
+    const workdirs = Array.from(new Set([...this.handles.keys(), ...this.pending.keys()]))
     await Promise.allSettled(workdirs.map((workdir) => this.stop(workdir)))
   }
 }
