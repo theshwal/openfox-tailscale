@@ -24,11 +24,11 @@ It is the plugin extraction of the original OpenFox PR #233 approach: Tailscale-
 - Tailscale CLI installed and authenticated on the OpenFox host
 - permission to use `tailscale serve`
 
-The lifecycle hooks are currently proposed in [co-l/openfox#233](https://github.com/co-l/openfox/pull/233).
+The lifecycle hooks are currently proposed in [co-l/openfox#233](https://github.com/co-l/openfox/pull/233). Until that PR is merged and released, use an OpenFox build containing those hooks to exercise automatic lifecycle integration.
 
 ## Installation
 
-Once this repository is public, install it from:
+Install it from:
 
 **OpenFox → Settings → Plugins → GitHub URL**
 
