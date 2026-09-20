@@ -70,7 +70,7 @@ test('findEntryForPort resolves a foreground Web entry', () => {
 })
 
 test('pickFreeServePort preserves pre-existing entries', () => {
-  assert.equal(pickFreServePort([443, 8443]), 10000)
+  assert.equal(pickFreeServePort([443, 8443]), 10000)
 })
 
 test('isAvailable reports a running Tailscale node', async () => {
