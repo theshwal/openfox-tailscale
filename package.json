@@ -1,0 +1,46 @@
+{
+  "name": "openfox-tailscale",
+  "version": "0.1.0",
+  "description": "Expose OpenFox dev servers securely over a Tailscale tailnet.",
+  "type": "module",
+  "main": "./src/index.js",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "openfox": {
+    "apiVersion": 2,
+    "entry": "./src/index.js",
+    "displayName": "Tailscale Preview",
+    "description": "Expose project dev servers securely over your Tailscale tailnet.",
+    "capabilities": [
+      "settings",
+      "ui",
+      "hooks",
+      "notifications"
+    ]
+  },
+  "scripts": {
+    "check": "node --check src/index.js && node --check src/tailscale-manager.js",
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "openfox": ">=2.0.151 <3"
+  },
+  "keywords": [
+    "openfox",
+    "tailscale",
+    "plugin",
+    "dev-server",
+    "preview"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theshwal/openfox-tailscale.git"
+  },
+  "bugs": {
+    "url": "https://github.com/theshwal/openfox-tailscale/issues"
+  }
+}
