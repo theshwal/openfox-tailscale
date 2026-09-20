@@ -1,4 +1,10 @@
-import { execFile as nodeExecFile, spawn as nodeSpawn } from 'node:child_process'
+import {
+  execFile as nodeExecFile,
+  spawn as nodeSpawn,
+  type ChildProcess,
+  type ExecFileException,
+  type SpawnOptions,
+} from 'node:child_process'
 import { resolve } from 'node:path'
 import { setTimeout as nodeSleep } from 'node:timers/promises'
 
@@ -12,21 +18,104 @@ const URL_REGEX = /https?:\/\/[^\s\x1b]+/g
 // eslint-disable-next-line no-control-regex
 const ANSI_REGEX = /\x1b\[[0-9;]*[A-Za-z]/g
 
-function stripAnsi(value) {
+export interface TailscaleLogger {
+  debug(message: string, context?: Record<string, unknown>): void
+  info(message: string, context?: Record<string, unknown>): void
+  warn(message: string, context?: Record<string, unknown>): void
+  error(message: string, context?: Record<string, unknown>): void
+}
+
+export interface PreviewResult {
+  url: string
+  remotePort: number
+}
+
+export interface ActivePreview extends PreviewResult {
+  workdir: string
+}
+
+export interface PortEntry {
+  port: number
+  host: string | null
+}
+
+export interface ServeEntryMatch {
+  webKey?: string
+  tcpKey?: string
+}
+
+type ExecFileCallback = (error: ExecFileException | null, stdout: string, stderr: string) => void
+export type ExecFileRunner = (
+  command: string,
+  args: string[],
+  options: { timeout: number; windowsHide: boolean; encoding: 'utf8' },
+  callback: ExecFileCallback,
+) => ChildProcess
+export type SpawnRunner = (command: string, args: string[], options: SpawnOptions) => ChildProcess
+export type SleepRunner = (delay?: number) => Promise<unknown>
+export type KillRunner = (pid: number, signal: NodeJS.Signals) => boolean | void
+
+export interface TailscalePreviewManagerOptions {
+  spawn?: SpawnRunner
+  execFile?: ExecFileRunner
+  sleep?: SleepRunner
+  kill?: KillRunner
+  logger?: TailscaleLogger
+  stabilizeTimeoutMs?: number
+  removalTimeoutMs?: number
+  pollMs?: number
+}
+
+interface PreviewHandle extends ActivePreview {
+  child: ChildProcess
+}
+
+interface PendingStart {
+  cancelled: boolean
+  child: ChildProcess | null
+  remotePort: number | null
+  done: Promise<PreviewResult> | null
+}
+
+interface StatusContainer {
+  TCP?: Record<string, unknown>
+  Web?: Record<string, unknown>
+}
+
+interface ServeStatus extends StatusContainer {
+  Foreground?: Record<string, StatusContainer>
+}
+
+interface TailscaleStatus {
+  BackendState?: string
+  Self?: {
+    DNSName?: string
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function stripAnsi(value: string): string {
   return value.replace(ANSI_REGEX, '')
 }
 
-function extractFirstUrl(raw) {
+function extractFirstUrl(raw: string): string | null {
   URL_REGEX.lastIndex = 0
   const match = URL_REGEX.exec(stripAnsi(raw))
   return match ? match[0].replace(/[.,;]+$/, '') : null
 }
 
-function collectPortEntries(parent, out) {
-  if (!parent || typeof parent !== 'object') return
+function asStatusContainer(value: unknown): StatusContainer | null {
+  return isRecord(value) ? (value as StatusContainer) : null
+}
+
+function collectPortEntries(parent: StatusContainer | null, out: PortEntry[]): void {
+  if (!parent) return
 
   const tcp = parent.TCP
-  if (tcp && typeof tcp === 'object') {
+  if (isRecord(tcp)) {
     for (const key of Object.keys(tcp)) {
       const port = Number.parseInt(key, 10)
       if (!Number.isNaN(port)) out.push({ port, host: null })
@@ -34,7 +123,7 @@ function collectPortEntries(parent, out) {
   }
 
   const web = parent.Web
-  if (web && typeof web === 'object') {
+  if (isRecord(web)) {
     for (const key of Object.keys(web)) {
       const colon = key.lastIndexOf(':')
       if (colon === -1) continue
@@ -44,24 +133,25 @@ function collectPortEntries(parent, out) {
   }
 }
 
-export function iterateStatusPorts(status) {
-  const out = []
-  if (!status || typeof status !== 'object') return out
+export function iterateStatusPorts(status: unknown): PortEntry[] {
+  if (!isRecord(status)) return []
+  const typedStatus = status as ServeStatus
+  const out: PortEntry[] = []
 
-  collectPortEntries(status, out)
+  collectPortEntries(typedStatus, out)
 
-  const foreground = status.Foreground
-  if (foreground && typeof foreground === 'object') {
+  const foreground = typedStatus.Foreground
+  if (isRecord(foreground)) {
     for (const entry of Object.values(foreground)) {
-      collectPortEntries(entry, out)
+      collectPortEntries(asStatusContainer(entry), out)
     }
   }
 
   return out
 }
 
-export function findEntryForPort(status, port) {
-  const result = {}
+export function findEntryForPort(status: unknown, port: number): ServeEntryMatch {
+  const result: ServeEntryMatch = {}
 
   for (const entry of iterateStatusPorts(status)) {
     if (entry.port !== port) continue
@@ -72,7 +162,7 @@ export function findEntryForPort(status, port) {
   return result
 }
 
-export function pickFreeServePort(usedPorts) {
+export function pickFreeServePort(usedPorts: Iterable<number>): number {
   const used = new Set(usedPorts)
 
   for (const candidate of CANDIDATE_HTTPS_PORTS) {
@@ -87,10 +177,24 @@ export function pickFreeServePort(usedPorts) {
 }
 
 export class TailscalePreviewManager {
-  constructor(options = {}) {
-    this.spawn = options.spawn ?? nodeSpawn
-    this.execFile = options.execFile ?? nodeExecFile
-    this.sleep = options.sleep ?? nodeSleep
+  private readonly spawn: SpawnRunner
+  private readonly execFile: ExecFileRunner
+  private readonly sleep: SleepRunner
+  private readonly kill: KillRunner
+  private readonly logger: TailscaleLogger
+  private readonly stabilizeTimeoutMs: number
+  private readonly removalTimeoutMs: number
+  private readonly pollMs: number
+  private readonly handles = new Map<string, PreviewHandle>()
+  private readonly pending = new Map<string, PendingStart>()
+
+  constructor(options: TailscalePreviewManagerOptions = {}) {
+    this.spawn = options.spawn ?? ((command, args, spawnOptions) => nodeSpawn(command, args, spawnOptions))
+    this.execFile =
+      options.execFile ??
+      ((command, args, execOptions, callback) =>
+        nodeExecFile(command, args, execOptions, callback))
+    this.sleep = options.sleep ?? ((delay = 0) => nodeSleep(delay))
     this.kill = options.kill ?? ((pid, signal) => process.kill(pid, signal))
     this.logger = options.logger ?? {
       debug() {},
@@ -101,25 +205,23 @@ export class TailscalePreviewManager {
     this.stabilizeTimeoutMs = options.stabilizeTimeoutMs ?? DEFAULT_STABILIZE_TIMEOUT_MS
     this.removalTimeoutMs = options.removalTimeoutMs ?? DEFAULT_REMOVAL_VERIFY_TIMEOUT_MS
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS
-    this.handles = new Map()
-    this.pending = new Map()
   }
 
-  key(workdir) {
+  private key(workdir: string): string {
     return resolve(workdir)
   }
 
-  isActive(workdir) {
+  isActive(workdir: string): boolean {
     return this.handles.has(this.key(workdir))
   }
 
-  getActive(workdir) {
+  getActive(workdir: string): ActivePreview | null {
     const handle = this.handles.get(this.key(workdir))
     if (!handle) return null
     return { workdir: handle.workdir, url: handle.url, remotePort: handle.remotePort }
   }
 
-  listActive() {
+  listActive(): ActivePreview[] {
     return Array.from(this.handles.values()).map(({ workdir, url, remotePort }) => ({
       workdir,
       url,
@@ -127,9 +229,9 @@ export class TailscalePreviewManager {
     }))
   }
 
-  execText(args, timeout = 4000) {
+  private execText(args: string[], timeout = 4000): Promise<string> {
     return new Promise((resolvePromise, reject) => {
-      this.execFile('tailscale', args, { timeout, windowsHide: true }, (error, stdout) => {
+      this.execFile('tailscale', args, { timeout, windowsHide: true, encoding: 'utf8' }, (error, stdout) => {
         if (error) {
           reject(error)
           return
@@ -139,10 +241,10 @@ export class TailscalePreviewManager {
     })
   }
 
-  async isAvailable() {
+  async isAvailable(): Promise<{ available: true; nodeName: string } | { available: false; reason: string }> {
     try {
       const stdout = await this.execText(['status', '--json'])
-      const parsed = JSON.parse(stdout)
+      const parsed = JSON.parse(stdout) as TailscaleStatus
 
       if (parsed.BackendState !== 'Running') {
         return {
@@ -157,7 +259,7 @@ export class TailscalePreviewManager {
       }
 
       return { available: true, nodeName }
-    } catch (error) {
+    } catch (error: unknown) {
       return {
         available: false,
         reason: error instanceof Error ? error.message : String(error),
@@ -165,12 +267,12 @@ export class TailscalePreviewManager {
     }
   }
 
-  async readServeStatus() {
+  private async readServeStatus(): Promise<unknown> {
     const stdout = await this.execText(['serve', 'status', '--json'])
-    return JSON.parse(stdout)
+    return JSON.parse(stdout) as unknown
   }
 
-  async listUsedServePorts() {
+  private async listUsedServePorts(): Promise<number[]> {
     try {
       const status = await this.readServeStatus()
       return Array.from(new Set(iterateStatusPorts(status).map((entry) => entry.port)))
@@ -179,7 +281,7 @@ export class TailscalePreviewManager {
     }
   }
 
-  async waitForEntry(port, timeoutMs = this.stabilizeTimeoutMs) {
+  private async waitForEntry(port: number, timeoutMs = this.stabilizeTimeoutMs): Promise<ServeEntryMatch | null> {
     const deadline = Date.now() + timeoutMs
 
     while (Date.now() < deadline) {
@@ -195,7 +297,7 @@ export class TailscalePreviewManager {
     return null
   }
 
-  async waitForEntryGone(port, timeoutMs = this.removalTimeoutMs) {
+  private async waitForEntryGone(port: number, timeoutMs = this.removalTimeoutMs): Promise<boolean> {
     const deadline = Date.now() + timeoutMs
 
     while (Date.now() < deadline) {
@@ -211,11 +313,11 @@ export class TailscalePreviewManager {
     return false
   }
 
-  async killChild(child) {
-    if (!child?.pid || child.exitCode !== null) return
+  private async killChild(child: ChildProcess): Promise<void> {
+    if (!child.pid || child.exitCode !== null) return
 
     let exited = false
-    const onExit = () => {
+    const onExit = (): void => {
       exited = true
     }
     child.once('exit', onExit)
@@ -240,9 +342,9 @@ export class TailscalePreviewManager {
     child.removeListener('exit', onExit)
   }
 
-  async forceRemoveEntry(handle) {
-    await new Promise((resolvePromise) => {
-      let child
+  private async forceRemoveEntry(handle: Pick<PreviewHandle, 'remotePort'>): Promise<void> {
+    await new Promise<void>((resolvePromise) => {
+      let child: ChildProcess
       try {
         child = this.spawn(
           'tailscale',
@@ -254,7 +356,7 @@ export class TailscalePreviewManager {
         return
       }
 
-      const finish = () => resolvePromise()
+      const finish = (): void => resolvePromise()
       child.once('exit', finish)
       child.once('error', finish)
     })
@@ -262,13 +364,13 @@ export class TailscalePreviewManager {
     await this.waitForEntryGone(handle.remotePort)
   }
 
-  async start(workdir, targetPort) {
+  async start(workdir: string, targetPort: number): Promise<PreviewResult> {
     const key = this.key(workdir)
     if (this.handles.has(key) || this.pending.has(key)) {
       throw new Error('A Tailscale preview is already active or starting for this workdir')
     }
 
-    const control = {
+    const control: PendingStart = {
       cancelled: false,
       child: null,
       remotePort: null,
@@ -288,9 +390,9 @@ export class TailscalePreviewManager {
     }
   }
 
-  async startInternal(key, targetPort, control) {
-    let child = null
-    let remotePort = null
+  private async startInternal(key: string, targetPort: number, control: PendingStart): Promise<PreviewResult> {
+    let child: ChildProcess | null = null
+    let remotePort: number | null = null
 
     try {
       if (control.cancelled) throw new Error('Tailscale preview start cancelled')
@@ -311,28 +413,31 @@ export class TailscalePreviewManager {
       let stdoutBuffer = ''
       let stderrBuffer = ''
       let exited = false
-      let exitCode = null
+      let exitCode: number | null = null
 
-      child.stdout?.on('data', (data) => {
+      child.stdout?.on('data', (data: Buffer | string) => {
         stdoutBuffer += data.toString()
       })
-      child.stderr?.on('data', (data) => {
+      child.stderr?.on('data', (data: Buffer | string) => {
         stderrBuffer += data.toString()
       })
 
-      const earlyExit = new Promise((resolvePromise) => {
-        child.once('error', (error) => {
+      type EarlyExit = { kind: 'exit'; code: number | null; stderr: string }
+      type Stabilized = { kind: 'status'; found: ServeEntryMatch | null }
+
+      const earlyExit = new Promise<EarlyExit>((resolvePromise) => {
+        child!.once('error', (error: Error) => {
           exited = true
           resolvePromise({ kind: 'exit', code: -1, stderr: error.message })
         })
-        child.once('exit', (code) => {
+        child!.once('exit', (code: number | null) => {
           exited = true
           exitCode = code
           resolvePromise({ kind: 'exit', code, stderr: stderrBuffer })
         })
       })
 
-      const stabilized = this.waitForEntry(remotePort).then((found) => ({
+      const stabilized = this.waitForEntry(remotePort).then<Stabilized>((found) => ({
         kind: 'status',
         found,
       }))
@@ -346,7 +451,7 @@ export class TailscalePreviewManager {
       if (outcome.kind === 'exit') {
         throw new Error(
           `tailscale serve exited before becoming active (code=${outcome.code ?? 'n/a'})` +
-            (outcome.stderr?.trim() ? `: ${outcome.stderr.trim()}` : ''),
+            (outcome.stderr.trim() ? `: ${outcome.stderr.trim()}` : ''),
         )
       }
 
@@ -368,7 +473,7 @@ export class TailscalePreviewManager {
         throw new Error('Tailscale preview start cancelled')
       }
 
-      const handle = {
+      const handle: PreviewHandle = {
         child,
         remotePort,
         url,
@@ -378,7 +483,7 @@ export class TailscalePreviewManager {
 
       this.logger.info('Tailscale preview started', { workdir: key, remotePort, url })
       return { url, remotePort }
-    } catch (error) {
+    } catch (error: unknown) {
       if (child) {
         try {
           await this.killChild(child)
@@ -398,7 +503,7 @@ export class TailscalePreviewManager {
     }
   }
 
-  async stop(workdir) {
+  async stop(workdir: string): Promise<void> {
     const key = this.key(workdir)
     const pending = this.pending.get(key)
 
@@ -425,7 +530,7 @@ export class TailscalePreviewManager {
 
     try {
       await this.killChild(handle.child)
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.warn('Failed to stop foreground Tailscale process cleanly', {
         workdir: key,
         error: error instanceof Error ? error.message : String(error),
@@ -442,7 +547,7 @@ export class TailscalePreviewManager {
     })
   }
 
-  async stopAll() {
+  async stopAll(): Promise<void> {
     const workdirs = Array.from(new Set([...this.handles.keys(), ...this.pending.keys()]))
     await Promise.allSettled(workdirs.map((workdir) => this.stop(workdir)))
   }

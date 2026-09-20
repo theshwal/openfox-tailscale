@@ -38,7 +38,7 @@ and use:
 https://github.com/theshwal/openfox-tailscale
 ```
 
-No plugin build step and no third-party npm dependencies are required.
+The repository contains the compiled `dist/` consumed by OpenFox, so installation from GitHub does not require a local TypeScript build.
 
 ## Enable for a project
 
@@ -79,14 +79,16 @@ This is a backend-host validation issue, not a Tailscale transport failure.
 
 ## Development
 
-The plugin is intentionally small and dependency-free.
+The source of truth is TypeScript in `src/`. `dist/` is generated JavaScript committed for zero-build plugin installation.
 
 ```bash
+npm install
+npm run typecheck
 npm test
-npm run check
+npm run compile
 ```
 
-Tests use Node's built-in test runner.
+Before committing a source change, regenerate `dist/`. CI runs `npm run check`, which type-checks, compiles, and fails if the committed `dist/` no longer matches the TypeScript source.
 
 ## Compatibility
 
@@ -96,7 +98,7 @@ Initial target:
 - Plugin API v2
 - Tailscale CLI with `serve` foreground support
 
-The plugin API is versioned; OpenFox core changes should not be required for routine plugin updates once the lifecycle hooks are merged.
+OpenFox 2.0.151 predates the two proposed dev-server hook names in its published TypeScript union. The plugin therefore contains one narrow typed compatibility cast for those two event names; it can be removed once #233 is released.
 
 ## Status
 

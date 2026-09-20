@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
+import type { ChildProcess } from 'node:child_process'
 
 import {
   TailscalePreviewManager,
   findEntryForPort,
   iterateStatusPorts,
   pickFreeServePort,
+  type ExecFileRunner,
+  type SpawnRunner,
 } from '../src/tailscale-manager.js'
 
 const FIXTURE = {
@@ -32,18 +35,32 @@ const FIXTURE = {
   },
 }
 
-function makeExecFile(responses) {
+interface ExecResponse {
+  error?: Error
+  stdout?: string
+  stderr?: string
+}
+
+function makeExecFile(responses: ExecResponse[]): ExecFileRunner {
   let index = 0
   return (_command, _args, _options, callback) => {
-    const response = responses[Math.min(index, responses.length - 1)]
+    const response = responses[Math.min(index, responses.length - 1)] ?? {}
     index += 1
     if (response.error) callback(response.error, '', '')
     else callback(null, response.stdout ?? '', response.stderr ?? '')
+    return new EventEmitter() as ChildProcess
   }
 }
 
-function makeChild({ stdout = '', stderr = '' } = {}) {
-  const child = new EventEmitter()
+interface MockChild extends EventEmitter {
+  pid: number
+  exitCode: number | null
+  stdout: EventEmitter
+  stderr: EventEmitter
+}
+
+function makeChild({ stdout = '', stderr = '' }: { stdout?: string; stderr?: string } = {}): MockChild {
+  const child = new EventEmitter() as MockChild
   child.pid = 9999
   child.exitCode = null
   child.stdout = new EventEmitter()
@@ -93,10 +110,10 @@ test('isAvailable reports a running Tailscale node', async () => {
 
 test('start uses a free port and stop removes only its own foreground entry', async () => {
   let active = false
-  const spawnCalls = []
+  const spawnCalls: Array<[string, string[]]> = []
   const foregroundChild = makeChild({ stdout: 'https://node.tailnet.ts.net:8443/\n' })
 
-  const spawn = (command, args) => {
+  const spawn: SpawnRunner = (command, args) => {
     spawnCalls.push([command, args])
 
     if (args.at(-1) === 'off') {
@@ -106,16 +123,16 @@ test('start uses a free port and stop removes only its own foreground entry', as
         cleanupChild.exitCode = 0
         cleanupChild.emit('exit', 0)
       })
-      return cleanupChild
+      return cleanupChild as unknown as ChildProcess
     }
 
     setImmediate(() => {
       active = true
     })
-    return foregroundChild
+    return foregroundChild as unknown as ChildProcess
   }
 
-  const execFile = (_command, args, _options, callback) => {
+  const execFile: ExecFileRunner = (_command, args, _options, callback) => {
     if (args[0] === 'serve' && args[1] === 'status') {
       const status = active
         ? FIXTURE
@@ -128,9 +145,10 @@ test('start uses a free port and stop removes only its own foreground entry', as
             },
           }
       callback(null, JSON.stringify(status), '')
-      return
+      return new EventEmitter() as ChildProcess
     }
     callback(new Error(`unexpected command: ${args.join(' ')}`), '', '')
+    return new EventEmitter() as ChildProcess
   }
 
   const manager = new TailscalePreviewManager({
@@ -155,28 +173,22 @@ test('start uses a free port and stop removes only its own foreground entry', as
   await manager.stop('/tmp/project')
 
   assert.equal(manager.isActive('/tmp/project'), false)
-  assert.equal(spawnCalls[0][0], 'tailscale')
-  assert.deepEqual(spawnCalls[0][1], [
-    'serve',
-    '--yes',
-    '--https=8443',
-    'http://localhost:10469',
-  ])
+  assert.equal(spawnCalls[0]?.[0], 'tailscale')
+  assert.deepEqual(spawnCalls[0]?.[1], ['serve', '--yes', '--https=8443', 'http://localhost:10469'])
   assert.equal(spawnCalls.some(([, args]) => args.includes('reset')), false)
 })
 
-
 test('stop cancels an in-flight preview start without leaving an orphan', async () => {
   let active = false
-  const spawnCalls = []
+  const spawnCalls: Array<[string, string[]]> = []
   const foregroundChild = makeChild({ stdout: 'https://node.tailnet.ts.net:8443/\n' })
 
-  const spawn = (command, args) => {
+  const spawn: SpawnRunner = (command, args) => {
     spawnCalls.push([command, args])
-    return foregroundChild
+    return foregroundChild as unknown as ChildProcess
   }
 
-  const execFile = (_command, args, _options, callback) => {
+  const execFile: ExecFileRunner = (_command, args, _options, callback) => {
     if (args[0] === 'serve' && args[1] === 'status') {
       const status = active
         ? FIXTURE
@@ -189,9 +201,10 @@ test('stop cancels an in-flight preview start without leaving an orphan', async 
             },
           }
       callback(null, JSON.stringify(status), '')
-      return
+      return new EventEmitter() as ChildProcess
     }
     callback(new Error(`unexpected command: ${args.join(' ')}`), '', '')
+    return new EventEmitter() as ChildProcess
   }
 
   const manager = new TailscalePreviewManager({
@@ -210,7 +223,7 @@ test('stop cancels an in-flight preview start without leaving an orphan', async 
 
   const startResult = manager.start('/tmp/racy-project', 10469).then(
     () => null,
-    (error) => error,
+    (error: unknown) => error,
   )
 
   await new Promise((resolve) => setImmediate(resolve))

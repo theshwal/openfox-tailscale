@@ -1,17 +1,18 @@
+import type { PluginContext, PluginHookPayload, PluginRegistry } from 'openfox/plugin'
 import { TailscalePreviewManager } from './tailscale-manager.js'
 
-let previewManager = null
-let activeContext = null
+let previewManager: TailscalePreviewManager | null = null
+let activeContext: PluginContext | null = null
 
-function asString(value) {
+function asString(value: unknown): string | null {
   return typeof value === 'string' ? value : null
 }
 
-function asPort(value) {
+function asPort(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65535 ? value : null
 }
 
-function publishPanel(context, manager) {
+function publishPanel(context: PluginContext, manager: TailscalePreviewManager): void {
   const active = manager.listActive()
   const latest = active.at(-1)
 
@@ -21,7 +22,7 @@ function publishPanel(context, manager) {
   context.publish('tailscale-preview', 'url', latest?.url ?? '—')
 }
 
-function notifyError(context, title, error) {
+function notifyError(context: PluginContext, title: string, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error)
   context.logger.warn(title, { error: message })
   context.notify({
@@ -31,7 +32,11 @@ function notifyError(context, title, error) {
   })
 }
 
-async function handleStarted(payload, context, manager) {
+async function handleStarted(
+  payload: PluginHookPayload,
+  context: PluginContext,
+  manager: TailscalePreviewManager,
+): Promise<void> {
   const workdir = asString(payload.data?.workdir)
   const targetPort = asPort(payload.data?.port)
   const projectId = typeof payload.projectId === 'string' && payload.projectId ? payload.projectId : null
@@ -80,7 +85,11 @@ async function handleStarted(payload, context, manager) {
   })
 }
 
-async function handleStopped(payload, context, manager) {
+async function handleStopped(
+  payload: PluginHookPayload,
+  context: PluginContext,
+  manager: TailscalePreviewManager,
+): Promise<void> {
   const workdir = asString(payload.data?.workdir)
   if (!workdir) return
 
@@ -88,7 +97,13 @@ async function handleStopped(payload, context, manager) {
   publishPanel(context, manager)
 }
 
-export function register(registry) {
+type DevServerHookName = 'devserver.started' | 'devserver.stopped'
+type DevServerHookRegistrar = (
+  event: DevServerHookName,
+  handler: (payload: PluginHookPayload) => void | Promise<void>,
+) => void
+
+export function register(registry: PluginRegistry): void {
   const context = registry.context
   const manager = new TailscalePreviewManager({ logger: context.logger })
 
@@ -150,15 +165,19 @@ export function register(registry) {
     ],
   })
 
-  registry.registerHook('devserver.started', (payload) => {
-    void handleStarted(payload, context, manager).catch((error) => {
+  // OpenFox 2.0.151 predates these two hook names in the published type union.
+  // The core PR adds them without changing the generic PluginHookPayload shape.
+  const registerDevServerHook = registry.registerHook.bind(registry) as DevServerHookRegistrar
+
+  registerDevServerHook('devserver.started', (payload) => {
+    void handleStarted(payload, context, manager).catch((error: unknown) => {
       notifyError(context, 'Failed to start Tailscale preview', error)
       publishPanel(context, manager)
     })
   })
 
-  registry.registerHook('devserver.stopped', (payload) => {
-    void handleStopped(payload, context, manager).catch((error) => {
+  registerDevServerHook('devserver.stopped', (payload) => {
+    void handleStopped(payload, context, manager).catch((error: unknown) => {
       notifyError(context, 'Failed to stop Tailscale preview', error)
       publishPanel(context, manager)
     })
@@ -167,7 +186,7 @@ export function register(registry) {
   publishPanel(context, manager)
 }
 
-export async function deactivate() {
+export async function deactivate(): Promise<void> {
   const manager = previewManager
   previewManager = null
 

@@ -1,17 +1,18 @@
 {
   "name": "openfox-tailscale",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Expose OpenFox dev servers securely over a Tailscale tailnet.",
   "type": "module",
-  "main": "./src/index.js",
+  "main": "./dist/index.js",
   "files": [
+    "dist",
     "src",
     "README.md",
     "LICENSE"
   ],
   "openfox": {
     "apiVersion": 2,
-    "entry": "./src/index.js",
+    "entry": "./dist/index.js",
     "displayName": "Tailscale Preview",
     "description": "Expose project dev servers securely over your Tailscale tailnet.",
     "capabilities": [
@@ -22,11 +23,19 @@
     ]
   },
   "scripts": {
-    "check": "node --check src/index.js && node --check src/tailscale-manager.js",
-    "test": "node --test test/*.test.js"
+    "typecheck": "tsc -p tsconfig.json",
+    "compile": "tsc -p tsconfig.build.json",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm run compile && git diff --exit-code -- dist"
   },
   "peerDependencies": {
     "openfox": ">=2.0.151 <3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "openfox": "2.0.151",
+    "tsx": "^4.20.5",
+    "typescript": "^5.8.3"
   },
   "keywords": [
     "openfox",
