@@ -1,0 +1,39 @@
+version: 1
+
+repository:
+  kind: plugin
+  default_base: main
+
+pr:
+  contract: v1
+  issue_link: refs
+  title: conventional
+  template: .github/pull_request_template.md
+
+quality:
+  source: repo
+  require_verified_criteria: true
+  require_clean_review: true
+  revalidate_after_repair: true
+
+publish:
+  target: origin
+  draft: false
+
+merge:
+  owner: automate
+  mode: auto
+  method: squash
+
+conflicts:
+  strategy: repair-revalidate
+
+post_merge:
+  verify: true
+
+human:
+  default: false
+  required_for:
+    - product-decision
+    - explicit-policy-exception
+    - unresolved-conflict
